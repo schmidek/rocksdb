@@ -1138,6 +1138,18 @@ void rocksdb_column_family_handle_destroy(
   delete handle;
 }
 
+void rocksdb_drop_column_families(
+    rocksdb_t* db,
+    int num_column_families,
+    rocksdb_column_family_handle_t** list,
+    char** errptr) {
+  std::vector<ColumnFamilyHandle*> handles;
+  for (int i = 0; i != num_column_families; ++i) {
+    handles.push_back(list[i]->rep);
+  }
+  SaveError(errptr, db->rep->DropColumnFamilies(handles));
+}
+
 void rocksdb_put(rocksdb_t* db, const rocksdb_writeoptions_t* options,
                  const char* key, size_t keylen, const char* val, size_t vallen,
                  char** errptr) {
