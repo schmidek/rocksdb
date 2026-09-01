@@ -116,6 +116,7 @@ using ROCKSDB_NAMESPACE::FlushOptions;
 using ROCKSDB_NAMESPACE::FlushWALOptions;
 using ROCKSDB_NAMESPACE::GetColumnFamilyMetaDataOptions;
 using ROCKSDB_NAMESPACE::GetFileChecksumGenCrc32cFactory;
+using ROCKSDB_NAMESPACE::GetMergeOperandsOptions;
 using ROCKSDB_NAMESPACE::HistogramData;
 using ROCKSDB_NAMESPACE::HyperClockCacheOptions;
 using ROCKSDB_NAMESPACE::ImportColumnFamilyOptions;
@@ -442,6 +443,22 @@ struct rocksdb_readoptions_t {
       };
     }
   }
+};
+struct rocksdb_getmergeoperandsoptions_t {
+  ~rocksdb_getmergeoperandsoptions_t() { ClearContinueCbState(); }
+
+  void ClearContinueCbState() {
+    if (continue_cb_destructor != nullptr) {
+      (*continue_cb_destructor)(continue_cb_state);
+    }
+    continue_cb_state = nullptr;
+    continue_cb_destructor = nullptr;
+  }
+
+  GetMergeOperandsOptions rep;
+  // state owned on behalf of `rep.continue_cb`
+  void* continue_cb_state = nullptr;
+  void (*continue_cb_destructor)(void*) = nullptr;
 };
 
 struct rocksdb_writeoptions_t {
@@ -2639,6 +2656,55 @@ char* rocksdb_get_cf_with_ts(rocksdb_t* db,
     }
   }
   return result;
+}
+
+static void GetMergeOperandsImpl(
+    rocksdb_t* db, const rocksdb_readoptions_t* options,
+    ColumnFamilyHandle* column_family, const char* key, size_t keylen,
+    rocksdb_getmergeoperandsoptions_t* get_merge_operands_options,
+    rocksdb_pinnableslice_t** merge_operands, int* num_operands,
+    char** errptr) {
+  *num_operands = 0;
+  const int max_operands =
+      get_merge_operands_options->rep.expected_max_number_of_operands;
+  std::vector<PinnableSlice> operands(
+      max_operands > 0 ? static_cast<size_t>(max_operands) : 0);
+  Status s = db->rep->GetMergeOperands(
+      options->rep, column_family, Slice(key, keylen), operands.data(),
+      &get_merge_operands_options->rep, num_operands);
+  if (s.ok()) {
+    for (int i = 0; i < *num_operands; ++i) {
+      merge_operands[i] = new (rocksdb_pinnableslice_t);
+      merge_operands[i]->rep = std::move(operands[i]);
+    }
+  } else if (!s.IsNotFound()) {
+    // On Status::Incomplete, *num_operands holds the number of merge operands
+    // found in the DB, which exceeds the capacity the caller provided.
+    SaveError(errptr, s);
+  }
+}
+
+void rocksdb_get_merge_operands(
+    rocksdb_t* db, const rocksdb_readoptions_t* options, const char* key,
+    size_t keylen,
+    rocksdb_getmergeoperandsoptions_t* get_merge_operands_options,
+    rocksdb_pinnableslice_t** merge_operands, int* num_operands,
+    char** errptr) {
+  GetMergeOperandsImpl(db, options, db->rep->DefaultColumnFamily(), key, keylen,
+                       get_merge_operands_options, merge_operands, num_operands,
+                       errptr);
+}
+
+void rocksdb_get_merge_operands_cf(
+    rocksdb_t* db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, const char* key,
+    size_t keylen,
+    rocksdb_getmergeoperandsoptions_t* get_merge_operands_options,
+    rocksdb_pinnableslice_t** merge_operands, int* num_operands,
+    char** errptr) {
+  GetMergeOperandsImpl(db, options, column_family->rep, key, keylen,
+                       get_merge_operands_options, merge_operands, num_operands,
+                       errptr);
 }
 
 char* rocksdb_get_db_identity(rocksdb_t* db, size_t* id_len) {
@@ -7228,6 +7294,45 @@ const char* rocksdb_readoptions_get_table_index_factory_name(
     *name_len = strlen(name);
   }
   return name;
+}
+
+rocksdb_getmergeoperandsoptions_t* rocksdb_getmergeoperandsoptions_create() {
+  return new rocksdb_getmergeoperandsoptions_t;
+}
+
+void rocksdb_getmergeoperandsoptions_destroy(
+    rocksdb_getmergeoperandsoptions_t* opt) {
+  delete opt;
+}
+
+void rocksdb_getmergeoperandsoptions_set_expected_max_number_of_operands(
+    rocksdb_getmergeoperandsoptions_t* opt, int v) {
+  opt->rep.expected_max_number_of_operands = v;
+}
+
+int rocksdb_getmergeoperandsoptions_get_expected_max_number_of_operands(
+    rocksdb_getmergeoperandsoptions_t* opt) {
+  return opt->rep.expected_max_number_of_operands;
+}
+
+void rocksdb_getmergeoperandsoptions_set_continue_cb(
+    rocksdb_getmergeoperandsoptions_t* opt, void* state,
+    void (*destructor)(void*),
+    unsigned char (*continue_cb)(void* state, const char* operand,
+                                 size_t operand_len)) {
+  opt->ClearContinueCbState();
+  if (continue_cb == nullptr) {
+    opt->rep.continue_cb = nullptr;
+    if (destructor != nullptr) {
+      (*destructor)(state);
+    }
+    return;
+  }
+  opt->continue_cb_state = state;
+  opt->continue_cb_destructor = destructor;
+  opt->rep.continue_cb = [state, continue_cb](Slice operand) {
+    return (*continue_cb)(state, operand.data(), operand.size()) != 0;
+  };
 }
 
 rocksdb_writeoptions_t* rocksdb_writeoptions_create() {

@@ -118,6 +118,8 @@ typedef struct rocksdb_block_cache_trace_writer_options_t
 typedef struct rocksdb_cuckoo_table_options_t rocksdb_cuckoo_table_options_t;
 typedef struct rocksdb_randomfile_t rocksdb_randomfile_t;
 typedef struct rocksdb_readoptions_t rocksdb_readoptions_t;
+typedef struct rocksdb_getmergeoperandsoptions_t
+    rocksdb_getmergeoperandsoptions_t;
 typedef struct rocksdb_seqfile_t rocksdb_seqfile_t;
 typedef struct rocksdb_slicetransform_t rocksdb_slicetransform_t;
 typedef struct rocksdb_snapshot_t rocksdb_snapshot_t;
@@ -641,6 +643,34 @@ extern ROCKSDB_LIBRARY_API char* rocksdb_get_cf_with_ts(
     rocksdb_t* db, const rocksdb_readoptions_t* options,
     rocksdb_column_family_handle_t* column_family, const char* key,
     size_t keylen, size_t* vallen, char** ts, size_t* tslen, char** errptr);
+
+/* Populates `merge_operands` with the merge operands stored in the DB for
+   `key`, in the order they were inserted (older insertions first), and assigns
+   the number of entries populated to *num_operands.
+
+   `merge_operands` must be an array of at least
+   `expected_max_number_of_operands` (as set on
+   `get_merge_operands_options`) elements, allocated by the caller. Each
+   non-NULL entry is owned by the caller and must be released with
+   rocksdb_pinnableslice_destroy() before the DB is closed.
+
+   If no merge operand is found, *num_operands is set to 0 and no error is
+   reported. If more merge operands exist than
+   `expected_max_number_of_operands`, `merge_operands` is left untouched, an
+   error is reported, and *num_operands is set to the number of merge operands
+   found in the DB for `key`. */
+extern ROCKSDB_LIBRARY_API void rocksdb_get_merge_operands(
+    rocksdb_t* db, const rocksdb_readoptions_t* options, const char* key,
+    size_t keylen,
+    rocksdb_getmergeoperandsoptions_t* get_merge_operands_options,
+    rocksdb_pinnableslice_t** merge_operands, int* num_operands, char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_get_merge_operands_cf(
+    rocksdb_t* db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, const char* key,
+    size_t keylen,
+    rocksdb_getmergeoperandsoptions_t* get_merge_operands_options,
+    rocksdb_pinnableslice_t** merge_operands, int* num_operands, char** errptr);
 
 /**
  * Returns a malloc() buffer with the DB identity, assigning the length to
@@ -3307,6 +3337,35 @@ extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_clear_table_index_factory(
 extern ROCKSDB_LIBRARY_API const char*
 rocksdb_readoptions_get_table_index_factory_name(const rocksdb_readoptions_t*,
                                                  size_t* name_len);
+
+/* Get merge operands options */
+
+extern ROCKSDB_LIBRARY_API rocksdb_getmergeoperandsoptions_t*
+rocksdb_getmergeoperandsoptions_create(void);
+extern ROCKSDB_LIBRARY_API void rocksdb_getmergeoperandsoptions_destroy(
+    rocksdb_getmergeoperandsoptions_t*);
+/* A hard limit on the number of merge operands returned by
+   rocksdb_get_merge_operands(). Defaults to 0. */
+extern ROCKSDB_LIBRARY_API void
+rocksdb_getmergeoperandsoptions_set_expected_max_number_of_operands(
+    rocksdb_getmergeoperandsoptions_t*, int);
+extern ROCKSDB_LIBRARY_API int
+rocksdb_getmergeoperandsoptions_get_expected_max_number_of_operands(
+    rocksdb_getmergeoperandsoptions_t*);
+/* `continue_cb` is called with each merge operand as it is read, excluding any
+   base value. Operands are read from newest to oldest. Returning 0 ends the
+   lookup at the operand `continue_cb` was just invoked on; returning a
+   non-zero value lets the lookup continue.
+
+   Passing a NULL `continue_cb` clears any previously set callback, in which
+   case the lookup always continues until there are no more merge operands.
+   `destructor`, when not NULL, is called with `state` once `state` is no
+   longer used, i.e. when the callback is replaced or the options object is
+   destroyed. */
+extern ROCKSDB_LIBRARY_API void rocksdb_getmergeoperandsoptions_set_continue_cb(
+    rocksdb_getmergeoperandsoptions_t*, void* state, void (*destructor)(void*),
+    unsigned char (*continue_cb)(void* state, const char* operand,
+                                 size_t operand_len));
 
 /* Write options */
 

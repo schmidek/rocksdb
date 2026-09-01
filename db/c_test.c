@@ -815,6 +815,15 @@ static char* MergeOperatorFullMerge(
   memcpy(result, "fake", 4);
   return result;
 }
+// Stops rocksdb_get_merge_operands() after a single merge operand, counting
+// the operands it saw in `arg`.
+static unsigned char ContinueOnceCb(void* arg, const char* operand,
+                                    size_t operand_len) {
+  (void)operand;
+  (void)operand_len;
+  (*(int*)arg)++;
+  return 0;
+}
 static char* MergeOperatorPartialMerge(void* arg, const char* key,
                                        size_t key_length,
                                        const char* const* operands_list,
@@ -2597,6 +2606,109 @@ int main(int argc, char** argv) {
     rocksdb_merge(db, woptions, "bar", 3, "barvalue", 8, &err);
     CheckNoError(err);
     CheckGet(db, roptions, "bar", "fake");
+  }
+
+  StartPhase("get_merge_operands");
+  {
+    // The DB opened by the "merge_operator" phase above is still around, and
+    // has a merge operator configured.
+    const char* expected[3] = {"op1", "op2", "op3"};
+    rocksdb_pinnableslice_t* operands[3];
+    int num_operands = -1;
+    int i;
+
+    rocksdb_getmergeoperandsoptions_t* gmo_options =
+        rocksdb_getmergeoperandsoptions_create();
+    CheckCondition(
+        0 == rocksdb_getmergeoperandsoptions_get_expected_max_number_of_operands(
+                 gmo_options));
+
+    for (i = 0; i < 3; i++) {
+      rocksdb_merge(db, woptions, "mergekey", 8, expected[i], 3, &err);
+      CheckNoError(err);
+    }
+
+    rocksdb_getmergeoperandsoptions_set_expected_max_number_of_operands(
+        gmo_options, 3);
+    CheckCondition(
+        3 == rocksdb_getmergeoperandsoptions_get_expected_max_number_of_operands(
+                 gmo_options));
+    rocksdb_get_merge_operands(db, roptions, "mergekey", 8, gmo_options,
+                               operands, &num_operands, &err);
+    CheckNoError(err);
+    CheckCondition(num_operands == 3);
+    for (i = 0; i < num_operands; i++) {
+      size_t vlen;
+      const char* val = rocksdb_pinnableslice_value(operands[i], &vlen);
+      CheckEqual(expected[i], val, vlen);
+      rocksdb_pinnableslice_destroy(operands[i]);
+    }
+
+    // Same thing on the default column family handle.
+    rocksdb_column_family_handle_t* default_cfh =
+        rocksdb_get_default_column_family_handle(db);
+    num_operands = -1;
+    rocksdb_get_merge_operands_cf(db, roptions, default_cfh, "mergekey", 8,
+                                  gmo_options, operands, &num_operands, &err);
+    CheckNoError(err);
+    CheckCondition(num_operands == 3);
+    for (i = 0; i < num_operands; i++) {
+      rocksdb_pinnableslice_destroy(operands[i]);
+    }
+    rocksdb_column_family_handle_destroy(default_cfh);
+
+    // Not enough room for all the operands: an error is reported and the
+    // number of operands found in the DB is still returned.
+    rocksdb_getmergeoperandsoptions_set_expected_max_number_of_operands(
+        gmo_options, 2);
+    num_operands = -1;
+    rocksdb_get_merge_operands(db, roptions, "mergekey", 8, gmo_options,
+                               operands, &num_operands, &err);
+    CheckCondition(err != NULL);
+    Free(&err);
+    CheckCondition(num_operands == 3);
+
+    // A key without merge operands reports no operands and no error.
+    rocksdb_getmergeoperandsoptions_set_expected_max_number_of_operands(
+        gmo_options, 3);
+    num_operands = -1;
+    rocksdb_get_merge_operands(db, roptions, "absentkey", 9, gmo_options,
+                               operands, &num_operands, &err);
+    CheckNoError(err);
+    CheckCondition(num_operands == 0);
+
+    // Stop reading operands after the first (newest) one. Operands are read
+    // from newest to oldest but returned in insertion order, so the newest
+    // operand is the only one returned.
+    int num_seen = 0;
+    rocksdb_getmergeoperandsoptions_set_continue_cb(
+        gmo_options, &num_seen, NULL, ContinueOnceCb);
+    num_operands = -1;
+    rocksdb_get_merge_operands(db, roptions, "mergekey", 8, gmo_options,
+                               operands, &num_operands, &err);
+    CheckNoError(err);
+    CheckCondition(num_seen == 1);
+    CheckCondition(num_operands == 1);
+    {
+      size_t vlen;
+      const char* val = rocksdb_pinnableslice_value(operands[0], &vlen);
+      CheckEqual("op3", val, vlen);
+      rocksdb_pinnableslice_destroy(operands[0]);
+    }
+
+    // Clearing the callback restores the "read everything" behavior.
+    rocksdb_getmergeoperandsoptions_set_continue_cb(gmo_options, NULL, NULL,
+                                                    NULL);
+    num_operands = -1;
+    rocksdb_get_merge_operands(db, roptions, "mergekey", 8, gmo_options,
+                               operands, &num_operands, &err);
+    CheckNoError(err);
+    CheckCondition(num_operands == 3);
+    for (i = 0; i < num_operands; i++) {
+      rocksdb_pinnableslice_destroy(operands[i]);
+    }
+
+    rocksdb_getmergeoperandsoptions_destroy(gmo_options);
   }
 
   StartPhase("columnfamilies");
